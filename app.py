@@ -104,7 +104,7 @@ def api_download():
         'nocheckcertificate': True,
         'http_headers': HEADERS,
         'extractor_args': {
-            'youtube': {'player_client': ['web', 'android']},
+            'youtube': {'player_client': ['ios', 'android', 'web']},
         },
     }
 
@@ -180,7 +180,7 @@ def api_savevideo():
         'http_headers': HEADERS,
         'format': fmt,
         'extractor_args': {
-            'youtube': {'player_client': ['web', 'android']},
+            'youtube': {'player_client': ['ios', 'android', 'web']},
         },
     }
 
