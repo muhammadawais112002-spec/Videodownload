@@ -64,18 +64,20 @@ def format_duration(seconds):
     s = seconds % 60
     return f'{h}:{m:02d}:{s:02d}' if h > 0 else f'{m}:{s:02d}'
 
-
 def cleanup_file(path, delay=180):
     """Delete temp file after delay seconds."""
     def _del():
         import time
         time.sleep(delay)
         try:
-            os.remove(path)
+            if os.path.exists(path):
+                os.remove(path)
         except Exception:
             pass
     threading.Thread(target=_del, daemon=True).start()
 
+def is_youtube(url):
+    return 'youtube.com' in url or 'youtu.be' in url
 
 # ─────────────────────────────────────────────
 #  Routes
@@ -96,56 +98,66 @@ def api_download():
     if not re.match(r'https?://', url):
         return jsonify({'success': False, 'error': 'Please enter a valid URL.'}), 400
 
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-        'noplaylist': True,
-        'nocheckcertificate': True,
-        'http_headers': HEADERS,
-        'extractor_args': {
-            'youtube': {'player_client': ['ios', 'android', 'web']},
-        },
-    }
-
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        # OPTION 2: Use pytubefix for YouTube to bypass bot detection completely
+        if is_youtube(url):
+            from pytubefix import YouTube
+            yt = YouTube(url, client='WEB')
+            
+            return jsonify({
+                'success': True,
+                'title': yt.title or 'Untitled Video',
+                'thumbnail': yt.thumbnail_url or '',
+                'duration': format_duration(yt.length),
+                'uploader': yt.author or 'Unknown',
+                'views': f"{yt.views:,}" if yt.views else 'N/A',
+                'platform': 'YouTube',
+                'original_url': url,
+                'ext': 'mp4',
+            })
+            
+        # Use yt-dlp for all other platforms
+        else:
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'skip_download': True,
+                'noplaylist': True,
+                'nocheckcertificate': True,
+                'http_headers': HEADERS,
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
 
-        if info is None:
-            return jsonify({'success': False, 'error': 'Could not extract video. Link may be private or unsupported.'}), 422
+            if info is None:
+                return jsonify({'success': False, 'error': 'Could not extract video.'}), 422
 
-        if info.get('_type') == 'playlist':
-            entries = info.get('entries') or []
-            if not entries:
-                return jsonify({'success': False, 'error': 'Playlist is empty.'}), 422
-            info = entries[0]
+            if info.get('_type') == 'playlist':
+                entries = info.get('entries') or []
+                if not entries:
+                    return jsonify({'success': False, 'error': 'Playlist is empty.'}), 422
+                info = entries[0]
 
-        title     = info.get('title') or 'Untitled Video'
-        thumbnail = info.get('thumbnail') or ''
-        duration  = format_duration(info.get('duration'))
-        uploader  = info.get('uploader') or info.get('channel') or 'Unknown'
-        view_count = info.get('view_count')
-        views     = f'{view_count:,}' if view_count else 'N/A'
-        platform  = info.get('extractor_key') or 'Unknown'
+            return jsonify({
+                'success': True,
+                'title': info.get('title') or 'Untitled Video',
+                'thumbnail': info.get('thumbnail') or '',
+                'duration': format_duration(info.get('duration')),
+                'uploader': info.get('uploader') or info.get('channel') or 'Unknown',
+                'views': f"{info.get('view_count'):,}" if info.get('view_count') else 'N/A',
+                'platform': info.get('extractor_key') or 'Unknown',
+                'original_url': url,
+                'ext': 'mp4',
+            })
 
-        return jsonify({
-            'success': True,
-            'title': title,
-            'thumbnail': thumbnail,
-            'duration': duration,
-            'uploader': uploader,
-            'views': views,
-            'platform': platform,
-            'original_url': url,
-            'ext': 'mp4',
-        })
-
-    except yt_dlp.utils.DownloadError as e:
-        msg = re.sub(r'^ERROR:\s*', '', str(e), flags=re.IGNORECASE)
-        return jsonify({'success': False, 'error': msg}), 422
     except Exception as e:
-        return jsonify({'success': False, 'error': f'Error: {str(e)}'}), 500
+        msg = str(e)
+        if 'Sign in' in msg or 'bot' in msg.lower():
+            msg = "YouTube bot detection triggered. Please try again."
+        elif hasattr(e, 'msg'):
+            msg = re.sub(r'^ERROR:\s*', '', e.msg, flags=re.IGNORECASE)
+        return jsonify({'success': False, 'error': msg}), 500
 
 
 # ── 2. Download video server-side & stream it ─
@@ -159,72 +171,84 @@ def api_savevideo():
         return jsonify({'error': 'No URL provided.'}), 400
 
     safe_name = re.sub(r'[\\/*?:"<>|]', '_', title)[:60]
-    out_template = os.path.join(DOWNLOAD_DIR, f'{safe_name}_%(id)s.%(ext)s')
-
-    has_ffmpeg = ffmpeg_available()
-
-    if has_ffmpeg:
-        # Best quality with merge
-        fmt = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best'
-    else:
-        # IMPORTANT: Without ffmpeg, only pick formats that already have BOTH
-        # video AND audio in a single file (no merging needed)
-        fmt = 'best[ext=mp4]/best[ext=webm]/best'
-
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-        'nocheckcertificate': True,
-        'outtmpl': out_template,
-        'http_headers': HEADERS,
-        'format': fmt,
-        'extractor_args': {
-            'youtube': {'player_client': ['ios', 'android', 'web']},
-        },
-    }
-
-    if has_ffmpeg:
-        ydl_opts['merge_output_format'] = 'mp4'
-        ydl_opts['ffmpeg_location'] = os.path.dirname(FFMPEG_PATH)
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(original_url, download=True)
+        # OPTION 2: Use pytubefix for YouTube
+        if is_youtube(original_url):
+            from pytubefix import YouTube
+            yt = YouTube(original_url, client='WEB')
+            stream = yt.streams.get_highest_resolution()
+            
+            if not stream:
+                return jsonify({'error': 'No video stream found for YouTube.'}), 422
+                
+            dl_name = f"{safe_name}.mp4"
+            filepath = os.path.join(DOWNLOAD_DIR, dl_name)
+            
+            # Download file to our temp directory
+            stream.download(output_path=DOWNLOAD_DIR, filename=dl_name)
+            
+            actual_ext = 'mp4'
 
-            if info is None:
-                return jsonify({'error': 'Download failed. Could not extract info.'}), 500
+        # Use yt-dlp for all other platforms
+        else:
+            out_template = os.path.join(DOWNLOAD_DIR, f'{safe_name}_%(id)s.%(ext)s')
+            has_ffmpeg = ffmpeg_available()
 
-            if info.get('_type') == 'playlist':
-                entries = info.get('entries') or []
-                if entries:
-                    info = entries[0]
+            if has_ffmpeg:
+                fmt = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best'
+            else:
+                fmt = 'best[ext=mp4]/best[ext=webm]/best'
 
-            filepath = ydl.prepare_filename(info)
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'noplaylist': True,
+                'nocheckcertificate': True,
+                'outtmpl': out_template,
+                'http_headers': HEADERS,
+                'format': fmt,
+            }
 
-        # yt-dlp might change extension after processing
-        if not os.path.exists(filepath):
-            base = os.path.splitext(filepath)[0]
-            for candidate_ext in ['mp4', 'webm', 'mkv', 'avi', 'mov', 'm4v']:
-                candidate = f'{base}.{candidate_ext}'
-                if os.path.exists(candidate):
-                    filepath = candidate
-                    break
+            if has_ffmpeg:
+                ydl_opts['merge_output_format'] = 'mp4'
+                ydl_opts['ffmpeg_location'] = os.path.dirname(FFMPEG_PATH)
 
-        # Also search by pattern in download dir if still not found
-        if not os.path.exists(filepath):
-            for fname in os.listdir(DOWNLOAD_DIR):
-                if safe_name[:20] in fname:
-                    filepath = os.path.join(DOWNLOAD_DIR, fname)
-                    break
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(original_url, download=True)
+                
+                if info is None:
+                    return jsonify({'error': 'Download failed. Could not extract info.'}), 500
+                    
+                if info.get('_type') == 'playlist':
+                    entries = info.get('entries') or []
+                    if entries:
+                        info = entries[0]
+                
+                filepath = ydl.prepare_filename(info)
 
-        if not os.path.exists(filepath):
-            return jsonify({'error': 'Downloaded file not found. Try again.'}), 500
+            # yt-dlp might change extension after processing
+            if not os.path.exists(filepath):
+                base = os.path.splitext(filepath)[0]
+                for candidate_ext in ['mp4', 'webm', 'mkv', 'avi', 'mov', 'm4v']:
+                    candidate = f'{base}.{candidate_ext}'
+                    if os.path.exists(candidate):
+                        filepath = candidate
+                        break
 
-        actual_ext = os.path.splitext(filepath)[1].lstrip('.') or 'mp4'
-        dl_name = re.sub(r'[\\/*?:"<>|]', '_', title)[:80] + '.' + actual_ext
+            if not os.path.exists(filepath):
+                for fname in os.listdir(DOWNLOAD_DIR):
+                    if safe_name[:20] in fname:
+                        filepath = os.path.join(DOWNLOAD_DIR, fname)
+                        break
 
-        # Schedule cleanup
+            if not os.path.exists(filepath):
+                return jsonify({'error': 'Downloaded file not found. Try again.'}), 500
+
+            actual_ext = os.path.splitext(filepath)[1].lstrip('.') or 'mp4'
+            dl_name = re.sub(r'[\\/*?:"<>|]', '_', title)[:80] + '.' + actual_ext
+
+        # Schedule cleanup and send file (Both YouTube and Others)
         cleanup_file(filepath, delay=180)
 
         return send_file(
@@ -234,11 +258,11 @@ def api_savevideo():
             mimetype='video/' + actual_ext,
         )
 
-    except yt_dlp.utils.DownloadError as e:
-        msg = re.sub(r'^ERROR:\s*', '', str(e), flags=re.IGNORECASE)
-        return jsonify({'error': msg}), 422
     except Exception as e:
-        return jsonify({'error': f'Server error: {str(e)}'}), 500
+        msg = str(e)
+        if hasattr(e, 'msg'):
+            msg = re.sub(r'^ERROR:\s*', '', e.msg, flags=re.IGNORECASE)
+        return jsonify({'error': f'Server error: {msg}'}), 500
 
 
 # ── 3. Status / debug endpoint ────────────────
